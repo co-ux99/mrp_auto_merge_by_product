@@ -15,13 +15,13 @@ class MrpProduction(models.Model):
         self.env.cr.execute(
             """
             SELECT id
-              FROM mrp_production
-             WHERE company_id = %s
-               AND product_id = %s
-               AND state IN ('draft', 'confirmed')
-             ORDER BY create_date ASC, id ASC
-             LIMIT 1
-             FOR UPDATE
+            FROM mrp_production
+            WHERE company_id = %s
+            AND product_id = %s
+            AND state IN ('draft', 'confirmed')
+            ORDER BY create_date ASC, id ASC
+            LIMIT 1
+            FOR UPDATE
             """,
             (company_id, product_id),
         )
@@ -31,7 +31,8 @@ class MrpProduction(models.Model):
     def _auto_merge_add_qty(self, target_mo, vals):
         """
         Προσθέτει την ποσότητα από τα vals στην υπάρχουσα MO, με μετατροπή μονάδας
-        αν χρειάζεται.
+        αν χρειάζεται. Ενημερώνει και τα stock moves ώστε το forecasted qty
+        να είναι σωστό στο product page.
         """
         add_qty = float(vals.get("product_qty") or 0.0)
         if not add_qty:
@@ -46,10 +47,25 @@ class MrpProduction(models.Model):
                 round=False,
             )
 
-        # Κρατάμε την παλιά MO ως έχει, αυξάνουμε μόνο την ποσότητα.
-        target_mo.write({"product_qty": target_mo.product_qty + add_qty})
+        new_qty = target_mo.product_qty + add_qty
 
-        # Προαιρετικά: συγχώνευση origin (αν περνιέται από κάπου).
+        # Ενημερώνουμε την ποσότητα της MO
+        target_mo.write({"product_qty": new_qty})
+
+        # ✅ Ενημερώνουμε το finished product move (αυτό που τροφοδοτεί το forecast)
+        finished_moves = target_mo.move_finished_ids.filtered(
+            lambda m: m.product_id == target_mo.product_id
+                      and m.state not in ('done', 'cancel')
+        )
+        if finished_moves:
+            finished_moves.write({"product_uom_qty": new_qty})
+
+        # ✅ Invalidate cache για να ανανεωθεί το forecasted qty παντού
+        target_mo.invalidate_recordset()
+        finished_moves.invalidate_recordset()
+        target_mo.product_id.invalidate_recordset()
+
+        # Προαιρετικά: συγχώνευση origin
         new_origin = (vals.get("origin") or "").strip()
         if new_origin:
             existing_origin = (target_mo.origin or "").strip()
@@ -102,7 +118,6 @@ class MrpProduction(models.Model):
 
         if to_create:
             created = super().create(to_create)
-            # Ό,τι δημιουργήθηκε τώρα, γίνεται και αυτό target για επόμενες εγγραφές.
             for mo in created:
                 cache_target_by_key[(mo.company_id.id, mo.product_id.id)] = mo
             created_or_merged |= created
